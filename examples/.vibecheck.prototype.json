@@ -1,0 +1,15 @@
+{
+  "//": "Prototype, spike or throwaway script: only clear-cut problems should block. Copy to .vibecheck.json in the project root.",
+  "preset": "lenient",
+  "maxRetries": 2,
+  "questions": {
+    "//": "Conventions still matter when the repo already has a style, so this one stays on.",
+    "test_coverage_adequate": { "enabled": false }
+  },
+  "hardGates": {
+    "failingTests": true,
+    "//": "A credential must never be committed, prototype or not.",
+    "committedSecret": true,
+    "submissionMismatch": false
+  }
+}

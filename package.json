@@ -1,0 +1,35 @@
+{
+  "name": "vibecheck-mcp",
+  "version": "0.1.0",
+  "description": "MCP server that acts as a completion-verdict gate for AI coding agents, judged by TypeSafe AI's Jev decision model.",
+  "license": "MIT",
+  "type": "module",
+  "engines": {
+    "node": ">=20"
+  },
+  "bin": {
+    "vibecheck-mcp": "dist/index.js"
+  },
+  "main": "dist/index.js",
+  "files": [
+    "dist",
+    "README.md"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "typecheck": "tsc -p tsconfig.json",
+    "dev": "tsx src/index.ts",
+    "start": "node dist/index.js",
+    "test": "node --import tsx --test \"test/**/*.test.ts\"",
+    "test:watch": "node --import tsx --test --watch \"test/**/*.test.ts\""
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.30.0",
+    "zod": "^3.25.76"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.2",
+    "tsx": "^4.19.2",
+    "typescript": "^5.7.2"
+  }
+}

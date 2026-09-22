@@ -1,0 +1,23 @@
+node_modules/
+dist/
+*.log
+
+# Never commit API keys.
+.env
+.env.local
+.env.*.local
+
+# Local review logs, convention cache and per-machine state.
+.vibecheck/
+
+# Test fixtures (temporary git repositories created by the test suite)
+.tmp-tests/
+
+# Editor / OS noise
+.DS_Store
+.idea/
+.vscode/
+*.tsbuildinfo
+
+# Freebuff workspace state
+.freebuff/

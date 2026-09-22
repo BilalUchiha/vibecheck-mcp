@@ -1,0 +1,13 @@
+{
+  "//": "Use a written style guide as the convention reference instead of sampling the repo. Copy to .vibecheck.json in the project root.",
+  "preset": "balanced",
+  "conventions": {
+    "mode": "file",
+    "styleGuide": "docs/STYLE.md"
+  },
+  "judge": {
+    "//": "Pin the model once you have tuned thresholds against it, so verdicts stay reproducible.",
+    "model": "jev-latest",
+    "diagnostics": true
+  }
+}
