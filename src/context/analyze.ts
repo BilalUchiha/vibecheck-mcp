@@ -671,6 +671,7 @@ export function findSwallowedErrors(
   const rawLines = linesOf(content);
   const findings: SwallowedError[] = [];
 
+  /** Shared sink: scope-filter, locate, and append one finding. */
   const record = (index: number, excerptNote: string, partiallyHandled: boolean): void => {
     const lineNumber = index + 1;
     if (consideredLines && !consideredLines.has(lineNumber)) return;
@@ -684,51 +685,61 @@ export function findSwallowedErrors(
   };
 
   if (language === "python") {
-    for (let index = 0; index < lines.length; index++) {
-      const line = lines[index] ?? "";
+    scanPythonSwallowedErrors(lines, record);
+  } else {
+    scanJsSwallowedErrors(lines, rawLines, record);
+  }
+  return findings;
+}
 
-      // `except: pass` on one line. Checked before the clause gate, because a
-      // one-line clause does not match the clause pattern (nothing after the
-      // colon) and would otherwise be skipped entirely.
-      if (/^\s*except\b[^:]*:\s*pass\s*$/.test(line)) {
-        record(index, "except clause swallows the error: ", false);
+/** Callback that appends one swallowed-error finding, already scope-filtered. */
+type SwallowedRecord = (index: number, excerptNote: string, partiallyHandled: boolean) => void;
+
+function scanPythonSwallowedErrors(lines: string[], record: SwallowedRecord): void {
+  for (let index = 0; index < lines.length; index++) {
+    const line = lines[index] ?? "";
+
+    // `except: pass` on one line. Checked before the clause gate, because a
+    // one-line clause does not match the clause pattern (nothing after the
+    // colon) and would otherwise be skipped entirely.
+    if (/^\s*except\b[^:]*:\s*pass\s*$/.test(line)) {
+      record(index, "except clause swallows the error: ", false);
+      continue;
+    }
+
+    const clause = PY_EXCEPT_CLAUSE.exec(line);
+    if (!clause) continue;
+    const indent = line.length - line.trimStart().length;
+
+    // Otherwise the body must be only `pass` (or comments) at a deeper indent.
+    let bodyIsPass = false;
+    let partiallyHandled = false;
+    for (let cursor = index + 1; cursor < lines.length; cursor++) {
+      const body = lines[cursor] ?? "";
+      if (!body.trim()) continue;
+      const bodyIndent = body.length - body.trimStart().length;
+      if (bodyIndent <= indent) break; // left the clause
+      if (PY_PASS.test(body)) {
+        bodyIsPass = true;
         continue;
       }
-
-      const clause = PY_EXCEPT_CLAUSE.exec(line);
-      if (!clause) continue;
-      const indent = line.length - line.trimStart().length;
-
-      // Otherwise the body must be only `pass` (or comments) at a deeper indent.
-      let bodyIsPass = false;
-      let partiallyHandled = false;
-      for (let cursor = index + 1; cursor < lines.length; cursor++) {
-        const body = lines[cursor] ?? "";
-        if (!body.trim()) continue;
-        const bodyIndent = body.length - body.trimStart().length;
-        if (bodyIndent <= indent) break; // left the clause
-        if (PY_PASS.test(body)) {
-          bodyIsPass = true;
-          continue;
-        }
-        // A real statement: the clause handles its error somehow.
-        if (PY_EXCEPT_HANDLES.test(body)) partiallyHandled = true;
-        break;
-      }
-
-      if (bodyIsPass) {
-        record(index, "except clause with only `pass` as its body: ", false);
-      } else if (partiallyHandled) {
-        // A clause whose body logs or rethrows: surfaced for the judge to
-        // weigh, but filtered out of the damning fix list by the feedback
-        // layer, because logging or propagating is a defensible choice.
-        record(index, "except clause only logs or rethrows (weigh, not a defect): ", true);
-      }
+      // A real statement: the clause handles its error somehow.
+      if (PY_EXCEPT_HANDLES.test(body)) partiallyHandled = true;
+      break;
     }
-    return findings;
-  }
 
-  // JS/TS: match the catch opening line, then look for a body.
+    if (bodyIsPass) {
+      record(index, "except clause with only `pass` as its body: ", false);
+    } else if (partiallyHandled) {
+      // A clause whose body logs or rethrows: surfaced for the judge to
+      // weigh, but filtered out of the damning fix list by the feedback
+      // layer, because logging or propagating is a defensible choice.
+      record(index, "except clause only logs or rethrows (weigh, not a defect): ", true);
+    }
+  }
+}
+
+function scanJsSwallowedErrors(lines: string[], rawLines: string[], record: SwallowedRecord): void {
   for (let index = 0; index < lines.length; index++) {
     const line = lines[index] ?? "";
     if (!/\bcatch\b/.test(line)) continue;
@@ -742,50 +753,62 @@ export function findSwallowedErrors(
     // Multi-line: find the opening brace, then scan the body until it closes.
     const brace = line.indexOf("{");
     if (brace === -1) continue;
-    let depth = 0;
-    let bodyStart = -1;
-    let bodyEnd = -1;
-    for (let cursor = index; cursor < lines.length; cursor++) {
-      const scan = lines[cursor] ?? "";
-      for (const char of scan) {
-        if (char === "{") {
-          depth++;
-          if (depth === 1) bodyStart = cursor;
-        } else if (char === "}") {
-          depth--;
-          if (depth === 0 && bodyStart !== -1) {
-            bodyEnd = cursor;
-            cursor = lines.length; // stop outer loop too
-            break;
-          }
-        }
+    const region = braceRegion(lines, index, brace);
+    if (!region) continue; // unbalanced: skip
+
+    classifyJsCatchBody(region, rawLines, record);
+  }
+}
+
+/** The [start, end] line indices of a brace region opening at `startLine`. */
+function braceRegion(lines: string[], startLine: number, braceOffset: number): { start: number; end: number } | null {
+  let depth = 0;
+  let start = -1;
+  let end = -1;
+  for (let cursor = startLine; cursor < lines.length; cursor++) {
+    const scan = lines[cursor] ?? "";
+    const from = cursor === startLine ? braceOffset : 0;
+    for (let position = from; position < scan.length; position++) {
+      if (scan[position] === "{") {
+        depth++;
+        if (depth === 1) start = cursor;
+      } else if (scan[position] === "}") {
+        depth--;
+        if (depth === 0 && start !== -1) return { start, end: cursor };
       }
     }
-    if (bodyStart === -1 || bodyEnd === -1) continue; // unbalanced: skip
-
-    // Analyse the RAW body lines: the stripped view leaves residue where
-    // comments were removed (e.g. `// x` becomes `/`), which would make a
-    // comment-only body look like a statement. `stripCode` preserves line
-    // indices, so `rawLines[bodyStart + 1 .. bodyEnd]` is the same region.
-    const bodyLines = rawLines.slice(bodyStart + 1, bodyEnd);
-    const statementLines = bodyLines.filter((bodyLine) => {
-      const withoutLineComment = bodyLine.replace(/\/\/.*$/, "");
-      const withoutBlockComments = withoutLineComment.replace(/\/\*.*?\*\//g, "").trim();
-      return withoutBlockComments.length > 0;
-    });
-
-    if (statementLines.length === 0 && bodyLines.some((bodyLine) => bodyLine.trim().length > 0)) {
-      // Blank apart from comments: the block still swallows the error, but a
-      // comment explaining why is defensible. Report it so the judge can weigh it.
-      record(bodyStart, "catch block with only a comment as its body: ", true);
-      continue;
-    }
-    if (statementLines.length === 0) {
-      record(bodyStart, "catch block swallows the error: ", false);
-    }
   }
+  return start !== -1 && end !== -1 ? { start, end } : null;
+}
 
-  return findings;
+/**
+ * Decide whether a JS catch body is empty, comment-only, or real. The RAW body
+ * lines are analysed: the stripped view leaves residue where comments were
+ * removed (e.g. `// x` becomes `/`), which would make a comment-only body look
+ * like a statement. `stripCode` preserves line indices, so raw and stripped
+ * regions align.
+ */
+function classifyJsCatchBody(
+  region: { start: number; end: number },
+  rawLines: string[],
+  record: SwallowedRecord,
+): void {
+  const bodyLines = rawLines.slice(region.start + 1, region.end);
+  const statementLines = bodyLines.filter((bodyLine) => {
+    const withoutLineComment = bodyLine.replace(/\/\/.*$/, "");
+    const withoutBlockComments = withoutLineComment.replace(/\/\*.*?\*\//g, "").trim();
+    return withoutBlockComments.length > 0;
+  });
+
+  if (statementLines.length === 0 && bodyLines.some((bodyLine) => bodyLine.trim().length > 0)) {
+    // Blank apart from comments: the block still swallows the error, but a
+    // comment explaining why is defensible. Report it so the judge can weigh it.
+    record(region.start, "catch block with only a comment as its body: ", true);
+    return;
+  }
+  if (statementLines.length === 0) {
+    record(region.start, "catch block swallows the error: ", false);
+  }
 }
 
 /* ------------------------------------------------------------------ *
