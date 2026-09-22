@@ -13,7 +13,7 @@
  */
 
 import { extractDeclarations, HUMAN_CASING, isTestFile, linesOf, stripCode } from "../context/lang.js";
-import { EMPTY_CATCH, NETWORK_CALL, UNTRUSTED_INPUT, identifierWords } from "../context/patterns.js";
+import { NETWORK_CALL, UNTRUSTED_INPUT, identifierWords } from "../context/patterns.js";
 import { MAX_FUNCTION_LINES } from "../context/analyze.js";
 import { describeStyle } from "../context/analyze.js";
 import { GATE_QUESTIONS } from "../questions.js";
@@ -588,6 +588,22 @@ function readabilityFeedback(score: DimensionScore, input: FeedbackInput): Rende
 
 function errorHandlingFeedback(score: DimensionScore, input: FeedbackInput): Rendered {
   const unhandled = input.analysis.unhandledAsync;
+  const swallowed = input.analysis.swallowedErrors;
+
+  // A silent catch is the most damning failure-handling finding: the error was
+  // detected and then deliberately hidden. It sorts above unguarded calls.
+  const silentCatches = swallowed.filter((item) => !item.partiallyHandled);
+  if (silentCatches.length > 0) {
+    return {
+      title: "An error is caught and then ignored",
+      instruction:
+        "Remove the empty catch clauses below, or handle the error each one swallows: surface it to the caller, or log it and take a deliberate recovery action. An empty block turns a loud failure into a silent one, which is harder to diagnose than a crash.",
+      evidence: silentCatches
+        .slice(0, MAX_EVIDENCE_PER_ITEM)
+        .map((item) => `${item.path}:${item.line} in ${item.container} — ${item.excerpt}`),
+      files: silentCatches.map((item) => item.path),
+    };
+  }
 
   if (unhandled.length > 0) {
     const calls = unhandled.slice(0, MAX_EVIDENCE_PER_ITEM).map((item) => {
@@ -622,17 +638,6 @@ function errorHandlingFeedback(score: DimensionScore, input: FeedbackInput): Ren
         "Validate each value below at the boundary where it enters the program, and fail with a clear error when it is invalid. Parsing input is not validating it: check the shape, type and range you actually rely on.",
       evidence: inputSites,
       files: extractFiles(inputSites),
-    };
-  }
-
-  const emptyCatch = sitesMatching(input.files, EMPTY_CATCH);
-  if (emptyCatch.length > 0) {
-    return {
-      title: "An error is caught and then ignored",
-      instruction:
-        "Remove the empty catch, or handle the error it swallows. An empty block turns a loud failure into a silent one, which is harder to diagnose than a crash.",
-      evidence: emptyCatch,
-      files: extractFiles(emptyCatch),
     };
   }
 

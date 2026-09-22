@@ -162,6 +162,17 @@ export interface UnhandledAsync {
   propagates: boolean;
 }
 
+export interface SwallowedError {
+  path: string;
+  line: number;
+  /** Enclosing function name, or a best-effort description. */
+  container: string;
+  /** The catch/except line as written, so the feedback can quote it. */
+  excerpt: string;
+  /** Whether the clause at least rethrows or logs, which softens the finding. */
+  partiallyHandled: boolean;
+}
+
 export interface GodFunction {
   path: string;
   name: string;
@@ -189,6 +200,7 @@ export interface AnalysisReport {
   risks: RiskFinding[];
   hardcoded: HardcodedFinding[];
   unhandledAsync: UnhandledAsync[];
+  swallowedErrors: SwallowedError[];
   godFunctions: GodFunction[];
   tests: TestSignals;
   totals: ChangeTotals;

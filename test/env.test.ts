@@ -131,7 +131,9 @@ describe("loadDotEnvFiles", () => {
     fs.mkdirSync(path.join(dir, "nested"), { recursive: true });
     fs.writeFileSync(path.join(dir, "nested", ".env"), `${key}=second\n`, "utf8");
 
-    const result = loadDotEnvFiles({ cwd: dir, envFile: ".env" });
+    // skipPackageRoot: without it the package's own .env (the developer's real
+    // key file) would be picked up and pollute the expected key list.
+    const result = loadDotEnvFiles({ cwd: dir, envFile: ".env", skipPackageRoot: true });
 
     assert.equal(process.env[key], "first");
     assert.deepEqual(result.keys, [key]);

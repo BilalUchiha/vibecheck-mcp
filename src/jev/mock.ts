@@ -40,6 +40,8 @@ interface Signals {
    * deliberate choice, so it is reported but not counted against the change.
    */
   swallowedFailures: number;
+  /** Catch/except clauses that neither handle nor log the error. */
+  silentCatches: number;
   floatingPromises: number;
   largeFunctions: number;
   testFiles: number;
@@ -94,6 +96,7 @@ function readSignals(state: ReviewState): Signals {
   const risks = asArray(analysis.risk_markers);
   const hardcoded = asArray(analysis.hardcoded_values);
   const unhandled = asArray(analysis.unhandled_async);
+  const swallowed = asArray(analysis.swallowed_errors);
   const largeFunctions = asArray(analysis.large_functions);
   const mismatches = asArray(analysis.casing_mismatches);
   const omittedList = asArray(analysis.files_omitted_from_state);
@@ -126,6 +129,7 @@ function readSignals(state: ReviewState): Signals {
     riskCounts: countBy(risks, "kind"),
     hardcodedCounts: countBy(hardcoded, "kind"),
     unhandled: unhandled.length,
+    silentCatches: swallowed.filter((item) => asRecord(item).partially_handled !== true).length,
     swallowedFailures: unhandled.filter((item) => {
       const record = asRecord(item);
       if (record.kind === "floating_promise") return true;
@@ -282,9 +286,12 @@ function levelFor(dimension: GateDimension, signals: Signals): number {
       if (!signals.hasFallibleOps) return 3; // nothing to handle
       // `swallowedFailures` excludes findings where the enclosing function
       // rethrows, because surfacing a failure to the caller is handling it.
-      if (signals.swallowedFailures === 0) return 3;
-      if (signals.swallowedFailures === 1) return 2;
-      if (signals.swallowedFailures <= 3) return 1;
+      // A silent catch is strictly worse than an unguarded call: the failure
+      // was caught and then deliberately hidden.
+      const worst = Math.max(signals.swallowedFailures, signals.silentCatches * 2);
+      if (worst === 0) return 3;
+      if (worst === 1) return 2;
+      if (worst <= 3) return 1;
       return 0;
     }
 
@@ -357,6 +364,7 @@ function diagnosticFor(id: string, signals: Signals): string {
         return pick("hardcoded_value_that_should_be_config");
       }
       if (signals.unhandled > 0) return pick("swallowed_error");
+      if (signals.silentCatches > 0) return pick("swallowed_error");
       return pick("none");
     }
     case "diagnostic_readability_gap": {
@@ -367,6 +375,7 @@ function diagnosticFor(id: string, signals: Signals): string {
     }
     case "diagnostic_error_handling_gap": {
       if (!signals.hasFallibleOps) return pick("not_applicable");
+      if (signals.silentCatches > 0) return pick("swallowed_error");
       if (signals.swallowedFailures === 0) return pick("none");
       if (signals.floatingPromises > 0) return pick("unhandled_rejection");
       return pick("missing_try_catch");

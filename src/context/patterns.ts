@@ -32,6 +32,24 @@ export const TRY_BLOCK_PY = /^\s*try\s*:/;
 /** An empty catch block, which turns a loud failure into a silent one. */
 export const EMPTY_CATCH = /catch\s*(?:\([^)]*\))?\s*\{\s*\}/;
 
+/**
+ * A catch clause whose body does nothing meaningful: empty, a lone comment
+ * (comments are stripped before matching), or just `pass` in Python. Matched
+ * line-by-line against stripped code, so a one-line `catch {}` and the closing
+ * line of a multi-line empty block are both found.
+ */
+export const EMPTY_CATCH_LINE =
+  /(?:catch\s*(?:\([^)]*\))?\s*\{\s*\}|catch\s*(?:\([^)]*\))?\s*\{$|^\s*(?:except\s*:\s*pass\s*|except\s*:\s*$|pass\s*$))/;
+
+/** Opens a Python except clause, possibly with a captured name. */
+export const PY_EXCEPT_CLAUSE = /^\s*except\b[^:]*:\s*(?:#.*)?$/;
+
+/** A Python `pass` statement, the body of a swallowed except. */
+export const PY_PASS = /^\s*pass\s*(?:#.*)?$/;
+
+/** A Python except clause that already handles the error: rethrows or logs. */
+export const PY_EXCEPT_HANDLES = /\braise\b|\bprint\s*\(|\blogger\b|\blogging\.|\blog\.|\blogging\.\w+|\.exception\s*\(|\.warning\s*\(|\.error\s*\(|\.info\s*\(/;
+
 /** Network calls that ought to carry a timeout. */
 export const NETWORK_CALL = /\b(?:fetch|axios|requests\.|http\.request|urlopen)\s*\(/;
 

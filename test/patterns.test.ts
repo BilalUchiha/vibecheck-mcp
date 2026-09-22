@@ -15,6 +15,7 @@ import {
   BENIGN_URL,
   CATCH_HANDLER,
   EMPTY_CATCH,
+  EMPTY_CATCH_LINE,
   FALLIBLE_JS_CALL,
   FALLIBLE_PY_CALL,
   identifierWords,
@@ -22,6 +23,8 @@ import {
   mentionsTunableName,
   NETWORK_CALL,
   PLACEHOLDER_VALUE,
+  PY_EXCEPT_CLAUSE,
+  PY_PASS,
   RETHROW,
   SECRET_PATTERNS,
   TRY_BLOCK_JS,
@@ -114,6 +117,44 @@ describe("URL and placeholder rules", () => {
     assert.ok(SECRET_PATTERNS.some((pattern) => pattern.test('const apiKey = "sk-live-9f8a7b6c5d4e3f2a1b0c";')));
     assert.ok(SECRET_PATTERNS.some((pattern) => pattern.test("-----BEGIN RSA PRIVATE KEY-----")));
     assert.equal(SECRET_PATTERNS.some((pattern) => pattern.test('const name = "report";')), false);
+  });
+});
+
+describe("empty catch clause detection", () => {
+  it("matches JS one-line empty catch blocks", () => {
+    for (const line of [
+      "  catch {}",
+      "  } catch {}",
+      "  } catch (error) {}",
+      "  } catch (error: unknown) {}",
+    ]) {
+      assert.ok(EMPTY_CATCH.test(line), line);
+    }
+  });
+
+  it("does not match a catch block with a body", () => {
+    assert.equal(EMPTY_CATCH.test('  } catch (error) { log(error); }'), false);
+  });
+
+  it("matches the opening of a JS multi-line empty catch", () => {
+    for (const line of ["  } catch (error) {", "  } catch {", "  try {\n  } catch (e) {"]) {
+      assert.ok(/catch\s*(?:\([^)]*\))?\s*\{$/.test(line), line);
+    }
+  });
+
+  it("matches Python except clauses and pass bodies", () => {
+    assert.ok(PY_EXCEPT_CLAUSE.test("    except:"));
+    assert.ok(PY_EXCEPT_CLAUSE.test("    except Exception:"));
+    assert.ok(PY_EXCEPT_CLAUSE.test("    except (OSError, ValueError) as error:"));
+    assert.equal(PY_EXCEPT_CLAUSE.test("    except: pass"), false, "one-line except:pass is a separate shape");
+    assert.ok(PY_PASS.test("        pass"));
+    assert.equal(PY_PASS.test("        process(data)"), false);
+  });
+
+  it("EMPTY_CATCH_LINE recognises both stacks' silent shapes", () => {
+    assert.ok(EMPTY_CATCH_LINE.test("  } catch {}"));
+    assert.ok(EMPTY_CATCH_LINE.test("    except: pass"));
+    assert.ok(EMPTY_CATCH_LINE.test("    except:"));
   });
 });
 

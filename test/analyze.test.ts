@@ -15,6 +15,7 @@ import {
   findCasingViolations,
   findHardcoded,
   findRisks,
+  findSwallowedErrors,
   findUnhandledAsync,
   maxNestingDepthOf,
   mergeProfiles,
@@ -349,5 +350,125 @@ describe("change-set aggregation", () => {
     assert.equal(report.totals.filesChanged, 3);
     assert.ok(report.totals.languages.includes("typescript"));
     assert.ok(report.totals.languages.includes("python"));
+  });
+});
+
+/* ------------------------------------------------------------------ *
+ * Swallowed errors
+ * ------------------------------------------------------------------ */
+
+describe("swallowed error detection", () => {
+  it("finds JS one-line empty catch blocks", () => {
+    const code = [
+      "export function load(path: string): unknown {",
+      "  try {",
+      "    return JSON.parse(readFileSync(path, 'utf8'));",
+      "  } catch {",
+      "    return null;",
+      "  }",
+      "}",
+      "",
+      "export function probe(url: string): void {",
+      "  try { fetch(url); } catch {}",
+      "}",
+    ].join("\n");
+    const findings = findSwallowedErrors("src/x.ts", code, "typescript", null);
+
+    assert.equal(findings.length, 1);
+    assert.equal(findings[0]?.line, 10);
+    assert.match(findings[0]?.excerpt ?? "", /catch block swallows/);
+  });
+
+  it("finds a JS multi-line catch whose body is empty or comment-only", () => {
+    const empty = [
+      "function a() {",
+      "  try { work(); }",
+      "  catch (error) {",
+      "  }",
+      "}",
+    ].join("\n");
+    const commented = [
+      "function b() {",
+      "  try { work(); }",
+      "  catch (error) {",
+      "    // nothing to do here",
+      "  }",
+      "}",
+    ].join("\n");
+
+    const emptyFindings = findSwallowedErrors("src/y.ts", empty, "typescript", null);
+    assert.equal(emptyFindings.length, 1);
+    assert.equal(emptyFindings[0]?.partiallyHandled, false);
+
+    const commentedFindings = findSwallowedErrors("src/y.ts", commented, "typescript", null);
+    assert.equal(commentedFindings.length, 1);
+    assert.equal(commentedFindings[0]?.partiallyHandled, true, "a comment explains, but the error is still swallowed");
+  });
+
+  it("does not accuse a catch block that handles the error", () => {
+    const code = [
+      "function a() {",
+      "  try { work(); }",
+      "  catch (error) {",
+      "    log.error('work failed', error);",
+      "    throw error;",
+      "  }",
+      "}",
+    ].join("\n");
+    assert.equal(findSwallowedErrors("src/z.ts", code, "typescript", null).length, 0);
+  });
+
+  it("finds Python bare except: pass, one-line and multi-line", () => {
+    const oneLine = "try:\n    process()\nexcept: pass\n";
+    const multi = "try:\n    process()\nexcept Exception:\n    pass\n";
+
+    const one = findSwallowedErrors("a.py", oneLine, "python", null);
+    assert.equal(one.length, 1);
+    assert.equal(one[0]?.line, 3);
+    assert.equal(one[0]?.partiallyHandled, false);
+
+    const multiFindings = findSwallowedErrors("a.py", multi, "python", null);
+    assert.equal(multiFindings.length, 1);
+    assert.equal(multiFindings[0]?.line, 3);
+    assert.match(multiFindings[0]?.excerpt ?? "", /only `pass`/);
+  });
+
+  it("surfaces but does not accuse a Python except that rethrows or logs", () => {
+    const rethrows = "try:\n    work()\nexcept OSError:\n    raise\n";
+    const logs = "try:\n    work()\nexcept OSError as error:\n    logger.warning('work failed: %s', error)\n";
+
+    // Both are recorded so the judge sees the handling, but marked
+    // partiallyHandled: the feedback layer filters them out of the fix list,
+    // because propagating or logging is a defensible choice, not a swallow.
+    for (const code of [rethrows, logs]) {
+      const findings = findSwallowedErrors("a.py", code, "python", null);
+      assert.equal(findings.length, 1, code);
+      assert.equal(findings[0]?.partiallyHandled, true, code);
+    }
+
+    // The damning category stays empty for both.
+    const silent = [rethrows, logs].flatMap((code) =>
+      findSwallowedErrors("a.py", code, "python", null).filter((finding) => !finding.partiallyHandled),
+    );
+    assert.equal(silent.length, 0);
+  });
+
+  it("respects the considered-lines scope when a diff is present", () => {
+    // Lines 1-2 exist but were not added in this change; line 3 (the empty
+    // catch) was. With the diff scope, only line 3 may be reported.
+    const code = "function a() {\n  try { work(); }\n  catch {}\n}\n";
+    const scope = new Set([3]);
+    const findings = findSwallowedErrors("a.ts", code, "typescript", scope);
+    assert.equal(findings.length, 1);
+    assert.equal(findings[0]?.line, 3);
+  });
+
+  it("flows through analyseChanges into the report", () => {
+    const report = analyseChanges({
+      files: [changed("src/flaky.ts", "try { work(); } catch {}\n")],
+      baseline: null,
+    });
+    assert.equal(report.swallowedErrors.length, 1);
+    assert.equal(report.swallowedErrors[0]?.partiallyHandled, false);
   });
 });

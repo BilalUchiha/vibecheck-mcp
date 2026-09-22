@@ -279,6 +279,13 @@ function digestAnalysis(analysis: AnalysisReport, config: VibecheckConfig): Reco
       enclosing_function_rethrows: item.propagates,
       excerpt: item.excerpt,
     })),
+    swallowed_errors: analysis.swallowedErrors.slice(0, CAPS.unhandledAsync).map((item) => ({
+      path: item.path,
+      line: item.line,
+      in: item.container,
+      partially_handled: item.partiallyHandled,
+      excerpt: item.excerpt,
+    })),
     large_functions: analysis.godFunctions.slice(0, CAPS.godFunctions).map((fn) => ({
       path: fn.path,
       name: fn.name,
