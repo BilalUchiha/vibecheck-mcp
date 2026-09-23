@@ -67,6 +67,9 @@ describe("MCP plumbing", () => {
     assert.equal(typeof structured.attempts_remaining, "number");
     assert.equal(typeof structured.attempt_number, "number");
 
+    const evidence = structured.evidence as { scope?: { rule?: string } } | undefined;
+    assert.ok(evidence?.scope?.rule, "the verdict must disclose which commits were reviewed");
+
     const textBlock = (result.content as { type: string; text: string }[]).find((block) => block.type === "text");
     assert.ok(textBlock?.text.includes("vibe-check"), "the text content must carry a readable verdict");
   });

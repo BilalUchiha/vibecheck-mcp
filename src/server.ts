@@ -13,8 +13,16 @@
 
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
-import { GATE_DIMENSIONS } from "./types.js";
-import { CONFIG_FILENAME, PRESETS, loadConfig, saveConfig, type PartialVibecheckConfig } from "./config.js";
+import { GATE_DIMENSIONS, type Verdict } from "./types.js";
+import {
+  CONFIG_FILENAME,
+  MAX_RETRIES_LIMIT,
+  PRESETS,
+  SCOPE_LIMITS,
+  loadConfig,
+  saveConfig,
+  type PartialVibecheckConfig,
+} from "./config.js";
 import { log } from "./logger.js";
 import { renderVerdictText, submitForReview } from "./review/orchestrator.js";
 import { recordReset, summariseLog, taskFingerprint } from "./review/ledger.js";
@@ -73,6 +81,7 @@ function registerSubmitForReview(server: McpServer): void {
         "An external judge (TypeSafe AI's Jev decision model) scores the change against eight dimensions and returns a verdict.",
         "If the verdict is `needs_fixes`, address every item in `feedback` in order and call this tool again.",
         "If it is `max_retries_exceeded`, stop: report to the user that the change did not pass review, and list the outstanding issues.",
+        "If it is `needs_clarification`, the request itself stated nothing checkable. Say what you took it to mean, then resubmit with that in `notes`; no retry is used.",
         "",
         "The review is performed against git's view of the repository when `project_root` is a git repository, so the change set does not depend on this argument being complete.",
       ].join("\n"),
@@ -84,7 +93,7 @@ function registerSubmitForReview(server: McpServer): void {
         changed_files: z
           .array(changedFileSchema)
           .optional()
-          .describe("The files you changed. Required when project_root is not a git repository; otherwise used to cross-check git's view."),
+          .describe("The files you changed. Required when project_root is not a git repository. On a repository, git supplies the change set, but listing the files still helps: a file git cannot place inside the reviewed range widens that range to include it, so report the whole change rather than one file from it."),
         project_root: z
           .string()
           .optional()
@@ -102,7 +111,9 @@ function registerSubmitForReview(server: McpServer): void {
         notes: z
           .string()
           .optional()
-          .describe("Anything the judge should know that is not visible in the diff, such as why an apparent shortcut is deliberate."),
+          .describe(
+            "Anything the judge should know that is not visible in the diff: why an apparent shortcut is deliberate, and - when the request is open-ended - the acceptance criteria you are working to. Criteria here make an otherwise unverifiable request judgeable.",
+          ),
       },
     },
     async (args) => {
@@ -154,7 +165,15 @@ function registerConfigureProject(server: McpServer): void {
       inputSchema: {
         project_root: z.string().optional().describe("Project root. Defaults to the server's working directory."),
         preset: z.enum(PRESETS as [string, ...string[]]).optional(),
-        max_retries: z.number().int().min(1).max(20).optional().describe("Maximum submissions per task before escalating to the user. Default 3."),
+        max_retries: z
+          .number()
+          .int()
+          .min(1)
+          .max(MAX_RETRIES_LIMIT)
+          .optional()
+          .describe(
+            "Maximum submissions for one request before escalating to the user. Counted server-side from the log, so the agent cannot reset it. Default 10: a budget that runs out while a fix list is still shrinking turns a fixable change into an escalation. Lower it for a short leash.",
+          ),
         questions: z
           .record(z.enum(GATE_DIMENSIONS as [string, ...string[]]), questionSchema)
           .optional()
@@ -188,6 +207,37 @@ function registerConfigureProject(server: McpServer): void {
             failing_tests: z.boolean().optional(),
             committed_secret: z.boolean().optional(),
             submission_mismatch: z.boolean().optional(),
+          })
+          .optional(),
+        intent: z
+          .object({
+            on_unverifiable_request: z
+              .enum(["clarify", "judge"])
+              .optional()
+              .describe(
+                "What to do when the task description states no checkable requirement. `clarify` (default) refuses to judge it and asks for acceptance criteria, because neither available verdict would be true; `judge` scores it anyway and gates on satisfies_request as usual.",
+              ),
+          })
+          .optional(),
+        scope: z
+          .object({
+            mode: z
+              .enum(["auto", "last-commit", "working-tree"])
+              .optional()
+              .describe("How much of the repository a review covers when the branch has no base to compare against. `auto` (default) reviews the trailing run of commits that plausibly belongs to the task, widened by the files you report; `last-commit` reviews only the newest commit; `working-tree` never looks at committed work."),
+            max_commits: z
+              .number()
+              .int()
+              .min(1)
+              .max(SCOPE_LIMITS.maxCommits)
+              .optional()
+              .describe("Hard cap on how many commits one review may span. Default 20."),
+            max_age_hours: z
+              .number()
+              .min(0)
+              .max(SCOPE_LIMITS.maxAgeHours)
+              .optional()
+              .describe("How far back a commit may be, in hours, and still count as task work. A file you explicitly report changing is reached regardless of age, within max_commits. Default 12."),
           })
           .optional(),
         reset_attempts: z
@@ -235,6 +285,20 @@ function registerConfigureProject(server: McpServer): void {
             ...(args.hard_gates.submission_mismatch !== undefined
               ? { submissionMismatch: args.hard_gates.submission_mismatch }
               : {}),
+          };
+        }
+        if (args.intent) {
+          overrides.intent = {
+            ...(args.intent.on_unverifiable_request
+              ? { onUnverifiableRequest: args.intent.on_unverifiable_request as "clarify" | "judge" }
+              : {}),
+          };
+        }
+        if (args.scope) {
+          overrides.scope = {
+            ...(args.scope.mode ? { mode: args.scope.mode as "auto" | "last-commit" | "working-tree" } : {}),
+            ...(args.scope.max_commits !== undefined ? { maxCommits: args.scope.max_commits } : {}),
+            ...(args.scope.max_age_hours !== undefined ? { maxAgeHours: args.scope.max_age_hours } : {}),
           };
         }
 
@@ -298,6 +362,8 @@ function renderConfig(
   lines.push(`- Preset: **${config.preset}**`);
   lines.push(`- Max retries per task: **${config.maxRetries}**`);
   lines.push(`- Conventions: mode \`${config.conventions.mode}\`${config.conventions.styleGuide ? ` (${config.conventions.styleGuide})` : ""}, sample size ${config.conventions.sampleSize}`);
+  lines.push(`- Review scope: mode \`${config.scope.mode}\`, up to ${config.scope.maxCommits} commits, ${config.scope.maxAgeHours}h window`);
+  lines.push(`- Unverifiable requests: \`${config.intent.onUnverifiableRequest}\``);
   lines.push(`- Judge: \`${config.judge.provider}\` model \`${config.judge.model}\`, diagnostics ${config.judge.diagnostics ? "on" : "off"}`);
   lines.push(`- Hard gates: ${Object.entries(config.hardGates).filter(([, on]) => on).map(([name]) => name).join(", ") || "none"}`);
   lines.push("");
@@ -346,7 +412,7 @@ function registerGetReviewLog(server: McpServer): void {
         project_root: z.string().optional().describe("Project root. Defaults to the server's working directory."),
         limit: z.number().int().min(1).max(200).optional().describe("How many recent entries to return. Default 10."),
         verdict: z
-          .enum(["approved", "needs_fixes", "max_retries_exceeded", "review_unavailable"])
+          .enum(["approved", "needs_fixes", "max_retries_exceeded", "review_unavailable", "needs_clarification"])
           .optional()
           .describe("Only return entries with this verdict."),
         task_description: z
@@ -362,7 +428,7 @@ function registerGetReviewLog(server: McpServer): void {
 
         const summary = summariseLog(resolved.stateDir, resolved.projectRoot, {
           ...(args.limit !== undefined ? { limit: args.limit } : {}),
-          ...(args.verdict ? { verdict: args.verdict as "approved" | "needs_fixes" | "max_retries_exceeded" | "review_unavailable" } : {}),
+          ...(args.verdict ? { verdict: args.verdict as Verdict } : {}),
           ...(fingerprint ? { fingerprint } : {}),
         });
 
@@ -419,6 +485,7 @@ function renderLog(summary: ReturnType<typeof summariseLog>, fingerprint: string
     lines.push(`Attempt ${entry.attempt ?? "?"}; judge ${entry.judge?.provider ?? "?"} (${entry.judge?.model ?? "?"}), ${entry.judge?.latency_ms ?? "?"}ms`);
     if (entry.task_preview) lines.push(`Task: ${entry.task_preview}`);
     if (entry.evidence_source) lines.push(`Evidence: ${entry.evidence_source}`);
+    if (entry.scope) lines.push(`Scope: \`${entry.scope.rule}\`, ${entry.scope.commits} commit(s) — ${entry.scope.range}`);
     if (entry.changed_files && entry.changed_files.length > 0) {
       lines.push(`Files: ${entry.changed_files.slice(0, 10).join(", ")}${entry.changed_files.length > 10 ? ` (+${entry.changed_files.length - 10} more)` : ""}`);
     }

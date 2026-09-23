@@ -296,6 +296,17 @@ describe("async failure handling", () => {
     assert.deepEqual(findUnhandledAsync("a.py", source, "python", null), []);
   });
 
+  it("stays quiet in test files, where a rejection is the assertion", () => {
+    // A test that awaits without try/catch is correct: the framework turns the
+    // rejection into a failure. Flagging it accuses the agent of a defect in code
+    // that is doing exactly what it should, and costs it a pointless round trip.
+    const source = "it('fetches', async () => {\n  const user = await fetchUser('u-1');\n  expect(user).toBeDefined();\n});\n";
+    assert.deepEqual(findUnhandledAsync("src/api.test.ts", source, "typescript", null), []);
+    assert.deepEqual(findUnhandledAsync("tests/test_api.py", source, "python", null), []);
+    // The same call in production code is still reported.
+    assert.equal(findUnhandledAsync("src/api.ts", source, "typescript", null).length > 0, true);
+  });
+
   it("records whether the enclosing function rethrows, so propagation is not mistaken for neglect", () => {
     const source = [
       "export async function load() {",

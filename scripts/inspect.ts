@@ -166,6 +166,7 @@ describe("deliverWebhook", () => {
 interface Options {
   root?: string;
   task?: string;
+  notes?: string;
   demo?: "python" | "ts";
   json: boolean;
   fix: boolean;
@@ -178,6 +179,7 @@ function parseArgs(argv: string[]): Options {
     const arg = argv[index];
     if (arg === "--root") options.root = argv[++index];
     else if (arg === "--task") options.task = argv[++index];
+    else if (arg === "--notes") options.notes = argv[++index];
     else if (arg === "--demo") options.demo = argv[++index] as Options["demo"];
     else if (arg === "--provider") options.provider = argv[++index] as Options["provider"];
     else if (arg === "--json") options.json = true;
@@ -196,6 +198,8 @@ function printUsage(): void {
   --demo <python|ts>   create a messy fixture repository and review it
   --root <path>        review an existing repository
   --task "<request>"   the user's original request
+  --notes "<text>"    context the diff cannot show, including acceptance criteria
+                       for an open-ended request
   --fix                repair the demo fixture and review again
   --provider <p>       mock (default, offline) or typesafe (needs TYPESAFE_API_KEY)
   --json               print the raw result instead of the rendered verdict
@@ -262,7 +266,11 @@ async function main(): Promise<void> {
       console.log(options.json ? JSON.stringify(after, null, 2) : renderVerdictText(after));
       console.log(`\nverdict moved: ${before.verdict} -> ${after.verdict}`);
     } else {
-      const result = await submitForReview({ task_description: task, project_root: root });
+      const result = await submitForReview({
+        task_description: task,
+        project_root: root,
+        ...(options.notes ? { notes: options.notes } : {}),
+      });
       console.log(options.json ? JSON.stringify(result, null, 2) : renderVerdictText(result));
     }
   } finally {

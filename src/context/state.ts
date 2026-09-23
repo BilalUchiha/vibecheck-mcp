@@ -18,7 +18,8 @@
 import { describeStyle, truncate } from "./analyze.js";
 import { HUMAN_CASING } from "./lang.js";
 import type { ConventionReference } from "./conventions.js";
-import type { Mismatch } from "./collect.js";
+import type { Mismatch, ReviewScopeReport } from "./collect.js";
+import type { RequestAssessment } from "./request.js";
 import type { AnalysisReport, ChangedFile, TestResults } from "../types.js";
 import type { VibecheckConfig } from "../config.js";
 
@@ -34,6 +35,8 @@ export interface StateChange {
 
 export interface ReviewState {
   task: string;
+  /** What the server could tell about the request itself, before judging it. */
+  task_assessment: Record<string, unknown>;
   change_summary: string;
   changes: StateChange[];
   changes_omitted: number;
@@ -70,6 +73,10 @@ export interface StateInput {
   testResults: TestResults | null;
   evidenceSource: "git" | "submitted";
   baseDescription: string | null;
+  /** Which commits the review covers, so the judge knows how much of the task it is seeing. */
+  scope: ReviewScopeReport | null;
+  /** Deterministic read on whether the request states anything checkable. */
+  assessment: RequestAssessment;
   mismatch: Mismatch | null;
   config: VibecheckConfig;
   /** Extra notes from the agent, e.g. what it ran. */
@@ -100,12 +107,41 @@ export function buildReviewState(input: StateInput): StateBuildResult {
       input.evidenceSource === "git"
         ? "The change set was produced by running git in the repository, not from the agent's description of it."
         : "project_root is not a git repository, so the change set is the agent's own report and may be incomplete.",
+    // The scope is spelled out because the judge otherwise has to guess how much
+    // of the task it is looking at, and the failure mode of that guess is a
+    // confident verdict that a complete task was under-delivered.
+    scope: input.scope
+      ? {
+          rule: input.scope.rule,
+          description: input.scope.description,
+          window_hours: input.scope.windowHours,
+          commits_covered: input.scope.commits.slice(0, 25).map((commit) => ({
+            sha: commit.shortSha,
+            subject: commit.subject,
+          })),
+          commits_covered_total: input.scope.commits.length,
+          reported_files_not_in_scope: input.scope.unreachedClaims,
+          note:
+            input.scope.commits.length > 1
+              ? `This task was committed in ${input.scope.commits.length} steps. The change set below is all of them, not only the newest commit.`
+              : "The change set below is the full reviewed range.",
+        }
+      : null,
     submitted_but_unchanged: input.mismatch?.claimedButUnchanged ?? [],
     changed_but_not_submitted: input.mismatch?.changedButUnclaimed ?? [],
   };
 
   const state: ReviewState = {
     task: input.taskDescription,
+    // Told to the judge because it is the difference between judging the change
+    // and judging the request: a vague request is not evidence of a bad change.
+    task_assessment: {
+      states_a_checkable_requirement: input.assessment.verifiable,
+      signals: input.assessment.signals,
+      note: input.assessment.verifiable
+        ? "The request states something checkable, so judge whether the change delivers it."
+        : "The request states no checkable requirement. Judge whether the change is a reasonable, complete response to what it does name, and do not assume requirements it does not state. If it is genuinely impossible to tell whether the request is satisfied, answer with low confidence rather than inferring a requirement.",
+    },
     // Stated explicitly so an empty change set is never mistaken for a
     // truncation artefact by the model reading the state.
     change_summary: input.files.length === 0 ? "No files were reported as changed by this task." : summarise(input.analysis),

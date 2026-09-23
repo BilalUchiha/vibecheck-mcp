@@ -14,12 +14,16 @@ import { detectLanguage, isTestFile, linesOf } from "./lang.js";
 import { shouldSkipPath } from "./filters.js";
 import {
   collectGitChangeSet,
+  lastCommitTouching,
   parseStatus,
   readRepoFile,
   runGit,
+  type GitCommit,
   type RepoInfo,
+  type ReviewScope,
 } from "./git.js";
 import type { ChangedFile, TestResults } from "../types.js";
+import type { ScopeConfig } from "../config.js";
 
 export interface SubmittedFile {
   path: string;
@@ -39,8 +43,20 @@ export interface CollectionResult {
   evidenceSource: "git" | "submitted";
   repo: RepoInfo | null;
   baseDescription: string | null;
+  /** Which commits the review covered, and how that range was chosen. */
+  scope: ReviewScopeReport | null;
   mismatch: Mismatch | null;
   warnings: string[];
+}
+
+/**
+ * What git looked at, plus the claims that fell outside it. The two are kept
+ * apart because they come from different places: git knows the range, only the
+ * submission knows what the agent believed it had done.
+ */
+export interface ReviewScopeReport extends ReviewScope {
+  /** Files the agent reported changing that were not inside the reviewed range. */
+  unreachedClaims: string[];
 }
 
 export function normalisePath(input: string): string {
@@ -51,13 +67,22 @@ export function collectChangedFiles(options: {
   projectRoot: string;
   submitted: SubmittedFile[];
   maxFiles: number;
+  /** How much of the repository a review may cover. */
+  scope?: ScopeConfig | undefined;
 }): CollectionResult {
   const { projectRoot, submitted, maxFiles } = options;
   const warnings: string[] = [];
-  const changeSet = collectGitChangeSet(projectRoot, maxFiles);
+  const claimedPaths = submitted
+    .map((file) => normalisePath(file.path))
+    .filter((claimed) => claimed.length > 0);
+  const changeSet = collectGitChangeSet(projectRoot, maxFiles, {
+    claimedPaths,
+    ...(options.scope ? { scope: options.scope } : {}),
+  });
 
   if (changeSet) {
     if (changeSet.error) warnings.push(changeSet.error);
+    warnings.push(...changeSet.warnings);
     const files: ChangedFile[] = [];
 
     for (const entry of changeSet.entries) {
@@ -88,7 +113,32 @@ export function collectChangedFiles(options: {
       const submittedPaths = new Set(
         submitted.map((file) => normalisePath(file.path)).filter((file) => file.length > 0),
       );
-      const claimedButUnchanged = [...submittedPaths].filter((file) => !gitPaths.has(file));
+
+      // A reported file that git can see but that falls outside the reviewed range
+      // is a scope problem, not dishonesty: it is reported to the agent and to the
+      // judge, and it does not fail the submission. A reported file git has no
+      // record of changing is a false claim, and stays a hard failure.
+      const outOfScope: { path: string; commit: GitCommit }[] = [];
+      for (const claimed of submittedPaths) {
+        if (gitPaths.has(claimed)) continue;
+        const commit = lastCommitTouching(changeSet.repo.topLevel, claimed);
+        if (!commit) continue;
+        outOfScope.push({ path: claimed, commit });
+      }
+      for (const entry of outOfScope) {
+        warnings.push(
+          `${entry.path} was reported as changed, but its last change is commit ${entry.commit.shortSha} (${new Date(
+            entry.commit.timestamp,
+          )
+            .toISOString()
+            .slice(0, 10)}), which is outside the reviewed range; that file's diff was not reviewed, so raise scope.maxCommits or commit inside the window to have it judged`,
+        );
+      }
+
+      const outOfScopePaths = new Set(outOfScope.map((entry) => entry.path));
+      const claimedButUnchanged = [...submittedPaths].filter(
+        (file) => !gitPaths.has(file) && !outOfScopePaths.has(file),
+      );
       const changedButUnclaimed = [...gitPaths].filter((file) => !submittedPaths.has(file));
 
       const mismatch: Mismatch | null =
@@ -101,6 +151,7 @@ export function collectChangedFiles(options: {
         evidenceSource: "git",
         repo: changeSet.repo,
         baseDescription: changeSet.baseDescription,
+        scope: { ...changeSet.scope, unreachedClaims: [...outOfScopePaths] },
         mismatch,
         warnings,
       };
@@ -143,6 +194,7 @@ export function collectChangedFiles(options: {
     evidenceSource: "submitted",
     repo: null,
     baseDescription: null,
+    scope: null,
     mismatch: null,
     warnings,
   };

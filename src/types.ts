@@ -250,13 +250,30 @@ export interface JevResponse {
  * ------------------------------------------------------------------ */
 
 /**
- * `review_unavailable` is an extension to the documented three-value contract.
- * It is used only when the review could not be performed at all (no usable
- * judge, unusable input). Reporting it as `needs_fixes` would send the agent off
- * to fix problems that were never identified, and reporting `approved` would be
- * a lie. It never consumes a retry.
+ * The documented contract has three verdicts. Two extensions exist, for the two
+ * cases where neither of the failure verdicts would be true:
+ *
+ * `review_unavailable` - the review could not be performed at all (no usable
+ *   judge, unusable input). Reporting it as `needs_fixes` would send the agent
+ *   off to fix problems that were never identified, and reporting `approved`
+ *   would be a lie.
+ *
+ * `needs_clarification` - the task description states no checkable requirement,
+ *   so "does this satisfy the request" has no determinate answer. Approving it
+ *   would certify work nobody defined.
+ *
+ * Neither consumes a retry: in both cases the agent has no failing change to
+ * work on.
  */
-export type Verdict = "approved" | "needs_fixes" | "max_retries_exceeded" | "review_unavailable";
+export type Verdict =
+  | "approved"
+  | "needs_fixes"
+  | "max_retries_exceeded"
+  | "review_unavailable"
+  | "needs_clarification";
+
+/** Verdicts that leave the retry budget untouched. */
+export const NON_GATING_VERDICTS: Verdict[] = ["review_unavailable", "needs_clarification"];
 
 /** A single question as sent to Jev. */
 export interface QuestionSpec {

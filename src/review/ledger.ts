@@ -19,7 +19,7 @@ import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import { log } from "../logger.js";
-import type { Verdict } from "../types.js";
+import { NON_GATING_VERDICTS, type Verdict } from "../types.js";
 
 export const LOG_FILENAME = "reviews.jsonl";
 
@@ -42,6 +42,8 @@ export interface ReviewLogEntry {
   feedback_count?: number;
   task_preview?: string;
   evidence_source?: "git" | "submitted";
+  /** Which commits the review covered, and how that range was chosen. */
+  scope?: { rule: string; commits: number; range: string } | null;
   changed_files?: string[];
   judge?: { provider: string; model: string; latency_ms: number; input_tokens?: number | null };
   config?: { preset: string; max_retries: number; config_path: string | null };
@@ -108,13 +110,14 @@ export function readEntries(stateDir: string): ReviewLogEntry[] {
  * which is what `configure_project({ reset: true })` writes by default.
  */
 /**
- * A submission only spends a retry if it actually produced a verdict. A judge
- * that was unreachable, or a malformed request, must not eat into the agent's
- * budget - otherwise a transient outage would escalate a reviewable change to
- * "max retries exceeded".
+ * A submission only spends a retry if the code was actually judged. A judge that
+ * was unreachable, or a request with nothing to check against, must not eat into
+ * the agent's budget - otherwise a transient outage, or a request the user left
+ * open-ended, would escalate a reviewable change to "max retries exceeded".
  */
 function consumesAttempt(entry: ReviewLogEntry): boolean {
-  return entry.verdict === "approved" || entry.verdict === "needs_fixes" || entry.verdict === "max_retries_exceeded";
+  if (!entry.verdict) return false;
+  return !NON_GATING_VERDICTS.includes(entry.verdict);
 }
 
 export function countAttempts(stateDir: string, fingerprint: string): number {

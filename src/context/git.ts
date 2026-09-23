@@ -15,6 +15,7 @@ import { spawnSync } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
 import { MAX_FILE_BYTES, shouldSkipPath } from "./filters.js";
+import type { ScopeConfig } from "../config.js";
 
 export interface GitResult {
   ok: boolean;
@@ -95,19 +96,27 @@ export function parseUnifiedDiff(text: string): FileDiff[] {
   if (!text.trim()) return files;
 
   const lines = text.split("\n");
-  let current: { header: string[]; path: string; oldPath: string | null; status: FileDiff["status"]; body: string[] } | null =
-    null;
+  let current: {
+    header: string[];
+    path: string;
+    oldPath: string | null;
+    status: FileDiff["status"];
+    body: string[];
+    /** True once the first hunk marker has been seen. */
+    inBody: boolean;
+    binary: boolean;
+  } | null = null;
 
   const flush = (): void => {
     if (!current) return;
     const diff = [...current.header, ...current.body].join("\n");
     let added = 0;
     let removed = 0;
-    let binary = false;
+    // Only the hunks count. The header's `+++ b/x` line also starts with `+`, so
+    // counting the header would add one phantom line to every file.
     for (const line of current.body) {
       if (line.startsWith("+")) added++;
       else if (line.startsWith("-")) removed++;
-      else if (line.startsWith("Binary files")) binary = true;
     }
     files.push({
       path: current.path,
@@ -115,7 +124,7 @@ export function parseUnifiedDiff(text: string): FileDiff[] {
       diff,
       added,
       removed,
-      binary,
+      binary: current.binary,
       oldPath: current.oldPath,
     });
     current = null;
@@ -131,6 +140,8 @@ export function parseUnifiedDiff(text: string): FileDiff[] {
         oldPath: parsed?.oldPath ?? null,
         status: "modified",
         body: [],
+        inBody: false,
+        binary: false,
       };
       continue;
     }
@@ -143,7 +154,13 @@ export function parseUnifiedDiff(text: string): FileDiff[] {
     } else if (line.startsWith("rename to")) {
       current.path = line.slice("rename to ".length).trim();
     }
-    current.header.push(line);
+    // A binary file is reported with no hunk at all, so its marker has to be
+    // caught before the header/body split rather than inside the body.
+    if (line.startsWith("Binary files")) current.binary = true;
+    // Everything before the first `@@` is metadata; from there on it is content.
+    if (line.startsWith("@@")) current.inBody = true;
+    if (current.inBody) current.body.push(line);
+    else current.header.push(line);
   }
   flush();
 
@@ -187,65 +204,342 @@ export function parseStatus(stdout: string): WorkingTreeEntry[] {
   return entries;
 }
 
+/* ------------------------------------------------------------------ *
+ * Review scope
+ * ------------------------------------------------------------------ *
+ * Which commits a review covers is a correctness question, not a convenience
+ * one. When the branch has a base to compare against, git answers it. When it
+ * does not - an agent working straight on `main`, or a repository with a single
+ * branch - git cannot say where the task began, and a wrong answer produces a
+ * confident verdict about the wrong evidence: a task committed in three steps
+ * looks like a one-file change, so the judge reports it as under-delivered.
+ *
+ * The scope is therefore chosen explicitly, disclosed in the verdict, and never
+ * allowed to be narrower than the files the agent said it changed.
+ */
+
+export interface GitCommit {
+  sha: string;
+  shortSha: string;
+  subject: string;
+  /** Committer timestamp, epoch milliseconds. */
+  timestamp: number;
+}
+
+interface CommitEntry {
+  commit: GitCommit;
+  /** Paths this commit touched, from `--name-only`. */
+  paths: string[];
+}
+
+export type ScopeRule =
+  /** The branch, against the merge-base with the repository's base branch. */
+  | "branch-base"
+  /** Uncommitted changes only; the project asked for this. */
+  | "working-tree"
+  /** The trailing run of commits inside the configured window. */
+  | "recent-commits"
+  /** Widened beyond the window to cover commits that touched reported files. */
+  | "claimed-commits"
+  /** Only the newest commit, because the project asked for that. */
+  | "last-commit"
+  /** No committed work could be attributed to the task. */
+  | "none";
+
+export interface ReviewScope {
+  rule: ScopeRule;
+  /** Commits included in the review, newest first. */
+  commits: GitCommit[];
+  /** What the diff was taken against, in plain language, for the verdict. */
+  description: string;
+  /** The commit window used to select work, in hours, when one applied. */
+  windowHours: number | null;
+}
+
+/** Field separator for `git log --format`, chosen because it cannot occur in a path. */
+const UNIT = "\u001f";
+const EMPTY_TREE = "4b825dc642cb6eb9a060e54bf8d69288fbee4904";
+const COMMIT_FORMAT = `--format=${UNIT}%H${UNIT}%h${UNIT}%ct${UNIT}%s`;
+
+const DEFAULT_SCOPE: ScopeConfig = { mode: "auto", maxCommits: 20, maxAgeHours: 12 };
+
+/** Milliseconds in an hour, for converting the configured window into a cutoff. */
+const MS_PER_HOUR = 3_600_000;
+
+function parseCommitLine(line: string): GitCommit | null {
+  const [, sha, shortSha, epoch, ...rest] = line.split(UNIT);
+  if (!sha || !shortSha || !epoch) return null;
+  const seconds = Number(epoch);
+  if (!Number.isFinite(seconds)) return null;
+  return { sha, shortSha, subject: rest.join(UNIT), timestamp: seconds * 1000 };
+}
+
+function collectCommitLines(stdout: string): GitCommit[] {
+  const commits: GitCommit[] = [];
+  for (const line of stdout.split("\n")) {
+    if (!line.startsWith(UNIT)) continue;
+    const commit = parseCommitLine(line);
+    if (commit) commits.push(commit);
+  }
+  return commits;
+}
+
+/** Commits reachable in `range` (e.g. `abc123..HEAD`), newest first. */
+export function listCommitsInRange(cwd: string, range: string, maxCount: number): GitCommit[] {
+  const result = runGit(cwd, ["log", "-n", String(Math.max(1, maxCount)), COMMIT_FORMAT, range]);
+  return result.ok ? collectCommitLines(result.stdout) : [];
+}
+
+/**
+ * The newest commits, newest first, each with the paths it touched.
+ *
+ * One `git log` call answers "has anything recent touched this file?" for every
+ * reported file at once, so claim-driven widening costs no extra process spawns.
+ */
+export function listCommitHistory(cwd: string, maxCount: number): CommitEntry[] {
+  const result = runGit(cwd, ["log", "-n", String(Math.max(1, maxCount)), COMMIT_FORMAT, "--name-only"]);
+  if (!result.ok) return [];
+
+  const commits: CommitEntry[] = [];
+  let current: CommitEntry | null = null;
+  for (const raw of result.stdout.split("\n")) {
+    if (raw.startsWith(UNIT)) {
+      const commit = parseCommitLine(raw);
+      current = commit ? { commit, paths: [] } : null;
+      if (current) commits.push(current);
+      continue;
+    }
+    const touched = raw.trim();
+    if (current && touched) current.paths.push(touched);
+  }
+  return commits;
+}
+
+/** The newest commit that touched `path`, or null when git has no record of one. */
+export function lastCommitTouching(cwd: string, filePath: string): GitCommit | null {
+  const result = runGit(cwd, ["log", "-n", "1", COMMIT_FORMAT, "--", filePath]);
+  if (!result.ok) return null;
+  return collectCommitLines(result.stdout)[0] ?? null;
+}
+
+/**
+ * A revision that diffs `sha` and everything after it, or null when `sha` is a
+ * root commit and therefore has no "before" to diff against.
+ */
+function parentRev(cwd: string, sha: string): string | null {
+  const parent = runGit(cwd, ["rev-parse", "--verify", "--quiet", `${sha}^`]);
+  const value = parent.stdout.trim();
+  return parent.ok && value ? value : null;
+}
+
+interface CommittedScopePlan {
+  scope: ReviewScope;
+  fromRev: string;
+  /** null diffs against the working tree instead of a commit. */
+  toRev: string | null;
+}
+
+/**
+ * Choose the commits a review covers when this branch has no base to compare
+ * against.
+ *
+ * The age window is a lower bound, never a ceiling: any file the agent reported
+ * changing pulls in the commit that last touched it, so a long session cannot be
+ * truncated by the clock. Commits the window misses and no claim reaches are
+ * named in `unreachedClaims` rather than silently dropped.
+ */
+function planCommittedScope(options: {
+  topLevel: string;
+  claimedPaths: string[];
+  settings: ScopeConfig;
+  includeWorkingTree: boolean;
+}): CommittedScopePlan | null {
+  const { topLevel, claimedPaths, settings } = options;
+  const history = listCommitHistory(topLevel, Math.max(1, settings.maxCommits));
+  const newest = history[0];
+  if (!newest) return null;
+
+  const cutoff = Date.now() - settings.maxAgeHours * MS_PER_HOUR;
+  const chosen = new Set<number>();
+  let windowDeepest = -1;
+
+  if (settings.mode === "last-commit") {
+    chosen.add(0);
+  } else {
+    history.forEach((entry, index) => {
+      if (entry.commit.timestamp < cutoff) return;
+      chosen.add(index);
+      windowDeepest = Math.max(windowDeepest, index);
+    });
+  }
+
+  // Claims widen the range; they never narrow it. A claim that cannot be placed
+  // is reconciled by the caller, which knows whether git has a record of the file
+  // at all and so can tell an out-of-scope report from a false one.
+  let widenedByClaims = false;
+  if (settings.mode === "auto" && claimedPaths.length > 0) {
+    const remaining = new Set(claimedPaths);
+    history.forEach((entry, index) => {
+      for (const touched of entry.paths) {
+        if (!remaining.delete(touched)) continue;
+        chosen.add(index);
+        if (index > windowDeepest) widenedByClaims = true;
+      }
+    });
+  }
+
+  let deepest = chosen.size > 0 ? Math.max(...chosen) : 0;
+
+  // A root commit has no "before". Diffing from the empty tree would present the
+  // whole repository as the change, which is both wrong and self-defeating: the
+  // convention baseline would then be sampled from the change itself. So the
+  // scope stops at the last commit that has a parent, and a repository with a
+  // single commit has no committed scope to review at all.
+  let fromRev = parentRev(topLevel, history[deepest]?.commit.sha ?? "");
+  while (deepest > 0 && fromRev === null) {
+    deepest -= 1;
+    fromRev = parentRev(topLevel, history[deepest]?.commit.sha ?? "");
+  }
+  if (fromRev === null) return null;
+  // Excluding the root commit can undo the widening the claims asked for; the
+  // rule reported in the verdict must describe the range actually reviewed.
+  if (deepest <= windowDeepest) widenedByClaims = false;
+
+  const oldest = history[deepest] ?? newest;
+  const span = Math.min(deepest + 1, history.length);
+  const range = span === 1 ? newest.commit.shortSha : `${newest.commit.shortSha}..${oldest.commit.shortSha}`;
+  const workingTree = options.includeWorkingTree ? " plus the uncommitted changes in the working tree" : "";
+
+  let rule: ScopeRule;
+  let description: string;
+  if (settings.mode === "last-commit") {
+    rule = "last-commit";
+    description = `the most recent commit (${newest.commit.shortSha})${workingTree}`;
+  } else if (widenedByClaims) {
+    rule = "claimed-commits";
+    description = `${span} commit(s) (${range})${workingTree}: widened beyond the last ${settings.maxAgeHours}h to cover the commits that touched the files you reported changing`;
+  } else {
+    rule = "recent-commits";
+    description =
+      `the last ${span} commit(s) (${range})${workingTree}` +
+      (options.includeWorkingTree
+        ? ""
+        : `; the working tree is clean and this branch has no base to compare against, so the trailing run of commits is treated as the task`);
+  }
+
+  return {
+    scope: {
+      rule,
+      commits: history.slice(0, span).map((entry) => entry.commit),
+      description,
+      windowHours: settings.mode === "auto" ? settings.maxAgeHours : null,
+    },
+    fromRev,
+    toRev: options.includeWorkingTree ? null : "HEAD",
+  };
+}
+
 export interface GitChangeSet {
   repo: RepoInfo;
   entries: WorkingTreeEntry[];
   diffs: Map<string, FileDiff>;
   /** Human-readable description of what the diff was taken against. */
   baseDescription: string;
+  /** How the reviewed range was chosen, and what it contains. */
+  scope: ReviewScope;
   /** Set when the diff could not be produced. */
   error: string | null;
+  /** Non-fatal problems worth surfacing to the agent. */
+  warnings: string[];
+}
+
+export interface CollectGitOptions {
+  /**
+   * Paths the agent reported changing. Used to *widen* the scope, never to
+   * narrow it: a change the server cannot see is the server's problem to solve,
+   * not a reason to judge a fraction of the work.
+   */
+  claimedPaths?: string[];
+  scope?: ScopeConfig;
 }
 
 /**
  * Collect the change set for a repository: committed work on this branch since
  * it diverged from the base, plus uncommitted and untracked changes.
  */
-export function collectGitChangeSet(cwd: string, maxFiles: number): GitChangeSet | null {
+export function collectGitChangeSet(
+  cwd: string,
+  maxFiles: number,
+  options: CollectGitOptions = {},
+): GitChangeSet | null {
   const repo = inspectRepo(cwd);
   if (!repo) return null;
+
+  const settings = options.scope ?? DEFAULT_SCOPE;
+  const claimedPaths = (options.claimedPaths ?? []).filter((claimed) => claimed.length > 0);
 
   const statusEntries = parseStatus(runGit(repo.topLevel, ["status", "--porcelain"]).stdout)
     .filter((entry) => !shouldSkipPath(entry.path));
 
+  const warnings: string[] = [];
   let diffText = "";
-  let baseDescription: string;
+  let fromRev: string;
+  let toRev: string | null = null;
   let error: string | null = null;
+  let scope: ReviewScope;
 
   if (repo.baseRef) {
-    const diff = runGit(repo.topLevel, ["diff", "--no-color", "-M", "-U3", repo.baseRef, "--"]);
-    if (diff.ok) {
-      diffText = diff.stdout;
-      baseDescription = `working tree vs merge-base ${repo.baseRef.slice(0, 12)}`;
-    } else {
-      baseDescription = "working tree";
-      error = `git diff against ${repo.baseRef} failed: ${diff.stderr.trim()}`;
-    }
+    const commits = listCommitsInRange(repo.topLevel, `${repo.baseRef}..HEAD`, 200);
+    scope = {
+      rule: "branch-base",
+      commits,
+      description: `the branch since it diverged from its base (merge-base ${repo.baseRef.slice(0, 12)})${
+        commits.length > 0 ? `, ${commits.length} commit(s)` : ""
+      }`,
+      windowHours: null,
+    };
+    fromRev = repo.baseRef;
+  } else if (settings.mode === "working-tree") {
+    scope = {
+      rule: "working-tree",
+      commits: [],
+      description: "the uncommitted changes in the working tree",
+      windowHours: null,
+    };
+    fromRev = repo.headSha ?? EMPTY_TREE;
   } else {
-    // No base branch: fall back to uncommitted work only, which is the common
-    // case for an agent that has not committed anything.
-    const diff = runGit(repo.topLevel, ["diff", "--no-color", "-M", "-U3", "HEAD", "--"]);
-    diffText = diff.ok ? diff.stdout : "";
-    baseDescription = "uncommitted changes vs HEAD";
-    if (!diff.ok && repo.headSha) {
-      error = `git diff HEAD failed: ${diff.stderr.trim()}`;
-    }
-
-    // A clean tree usually means the agent committed its work. With no base
-    // branch to compare against, the most recent commit is the best evidence
-    // available - and the verdict states that this is what it looked at, so the
-    // basis of the review is never a secret.
-    if (diffText.trim().length === 0 && statusEntries.length === 0 && repo.headSha) {
-      const hasParent = runGit(repo.topLevel, ["rev-parse", "--verify", "--quiet", "HEAD~1"]).ok;
-      if (hasParent) {
-        const committed = runGit(repo.topLevel, ["diff", "--no-color", "-M", "-U3", "HEAD~1", "HEAD", "--"]);
-        if (committed.ok && committed.stdout.trim().length > 0) {
-          diffText = committed.stdout;
-          baseDescription = "the most recent commit, because the working tree is clean";
-        }
-      }
+    const plan = planCommittedScope({
+      topLevel: repo.topLevel,
+      claimedPaths,
+      settings,
+      includeWorkingTree: statusEntries.length > 0,
+    });
+    if (plan) {
+      scope = plan.scope;
+      fromRev = plan.fromRev;
+      toRev = plan.toRev;
+    } else {
+      // No commit to attribute to the task, so the uncommitted work is all there
+      // is. The caller falls back to the agent's own description and says so.
+      scope = {
+        rule: "none",
+        commits: [],
+        description: "the uncommitted changes in the working tree",
+        windowHours: null,
+      };
+      fromRev = repo.headSha ?? EMPTY_TREE;
     }
   }
+
+  const diffArgs = ["diff", "--no-color", "-M", "-U3", fromRev, ...(toRev ? [toRev] : []), "--"];
+  const diff = runGit(repo.topLevel, diffArgs);
+  if (diff.ok) {
+    diffText = diff.stdout;
+  } else {
+    error = `git diff ${fromRev}${toRev ? ` ${toRev}` : ""} failed: ${diff.stderr.trim()}`;
+  }
+
+
 
   const parsed = parseUnifiedDiff(diffText);
   for (const file of parsed) {
@@ -266,6 +560,7 @@ export function collectGitChangeSet(cwd: string, maxFiles: number): GitChangeSet
     (entry) => entry.status === "added" && !diffs.has(entry.path),
   );
   const limited = untracked.slice(0, Math.max(0, maxFiles - diffs.size));
+  const baseDescription = scope.description;
 
   return {
     repo,
@@ -275,7 +570,9 @@ export function collectGitChangeSet(cwd: string, maxFiles: number): GitChangeSet
     }).concat(limited),
     diffs,
     baseDescription,
+    scope,
     error,
+    warnings,
   };
 }
 

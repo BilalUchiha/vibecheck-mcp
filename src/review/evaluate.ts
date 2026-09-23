@@ -193,8 +193,8 @@ function evaluateHardGates(input: EvaluationInput): HardGateFailure[] {
     failures.push({
       gate: "submission_mismatch",
       message:
-        "The change set claimed files that git does not report as changed. The review was performed against git's view of the repository, so either the claim or the change is wrong.",
-      evidence: mismatch.claimedButUnchanged.slice(0, 10).map((file) => `claimed but unchanged: ${file}`),
+        "The change set named files that are not in the reviewed diff. The review is performed against git's view of the repository, so either the path is wrong or the change is not there. A file git can see but places outside the reviewed range is reported in `warnings` instead, and is not a failure.",
+      evidence: mismatch.claimedButUnchanged.slice(0, 10).map((file) => `reported but not in the reviewed diff: ${file}`),
     });
   }
 

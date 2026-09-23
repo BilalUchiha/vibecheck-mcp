@@ -204,11 +204,18 @@ function requestFeedback(score: DimensionScore, input: FeedbackInput): Rendered 
       };
 
     default:
+      // Reaching here means the diagnostic named no specific unmet requirement,
+      // so echoing the request back as a checklist only tells the agent to
+      // re-check the thing it already believes it did. The evidence gap is what
+      // is actually actionable, so report that and stop.
       return {
-        title: "The result does not clearly satisfy the request",
+        title: "The request could not be verified as satisfied",
         instruction:
-          `The judge scored the request as ${describe(score)} not fully satisfied. Verify each requirement below is implemented and observable, then resubmit with the specific evidence that shows it.`,
-        evidence: [...checklist, ...defaultEvidence(input)],
+          "The judge could not confirm the change delivers the request, and did not name a specific missing requirement. Treat this as an evidence problem: if the request is open-ended, state in `notes` which concrete requirements you took it to mean and how each one is observable (a command to run, a named file and function, a resulting behaviour). If the request does name a specific behaviour, verify it end to end and fix what is missing. Resubmit with that evidence.",
+        evidence: [
+          `the request as judged: ${truncate(input.taskDescription.trim(), 200)}`,
+          ...defaultEvidence(input),
+        ],
         files: input.files.map((file) => file.path),
       };
   }

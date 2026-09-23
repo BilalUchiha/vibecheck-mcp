@@ -529,6 +529,11 @@ export function findUnhandledAsync(
   consideredLines: Set<number> | null,
 ): UnhandledAsync[] {
   if (language === "other") return [];
+  // In test code, a rejected promise fails the test - that *is* the failure
+  // handling, and asking for a try/catch around it would defeat the test. A
+  // literal expected value in a test is not configuration either, so this matches
+  // how the hardcoded-value check treats test files.
+  if (isTestFile(path)) return [];
   const lines = linesOf(stripCode(content, language));
   const rawLines = linesOf(content);
   const findings: UnhandledAsync[] = [];

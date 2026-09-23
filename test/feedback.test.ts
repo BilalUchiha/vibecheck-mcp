@@ -348,4 +348,16 @@ describe("feedback ordering and honesty", () => {
       assert.ok(item.evidence.length > 0, `${dimension} must still cite measured evidence`);
     }
   });
+
+  it("treats an unnamed request failure as an evidence problem, not as a checklist", () => {
+    const [item] = feedbackFor(built, [dimensionScore("satisfies_request", 0.3, null)]);
+    assert.ok(item);
+    // With no diagnostic there is no unmet requirement to name, so echoing the
+    // request back would tell the agent to re-check what it already believes it did.
+    assert.ok(
+      !item.evidence.some((line) => line.startsWith("confirm this is implemented")),
+      "the request must not be handed back as a checklist item",
+    );
+    assert.match(item.instruction, /notes/, "the agent is told how to make the request verifiable");
+  });
 });

@@ -26,9 +26,18 @@ server's `submit_for_review` tool:
 - `task_description`: the user's original request, as they wrote it. Never
   substitute a paraphrase that your change happens to satisfy.
 - `project_root`: the absolute path to this repository.
+- `changed_files`: every file this task changed, including ones you committed in
+  earlier steps. Git supplies the change set in a repository, but reporting the
+  files widens the reviewed range to cover work git would otherwise place
+  outside it. Do not list a file you did not change: a claim git cannot place at
+  all fails the review outright.
 - `test_results`: the raw output if you ran tests.
 - `notes`: only for context the diff cannot show, such as why an apparent
-  shortcut is deliberate.
+  shortcut is deliberate. When the user's request is open-ended (`make it
+  better`, `improve the error handling`), this is where the acceptance criteria
+  you are working to belong — an open-ended request with explicit criteria is
+  judged normally, and without them the gate will ask for them instead of
+  guessing.
 
 Then act on `verdict`:
 
@@ -38,11 +47,21 @@ Then act on `verdict`:
   do not hand the issues back to the user to resolve.
 - `max_retries_exceeded` — stop editing. Tell the user the change did not pass
   review, list the outstanding issues, and let them decide what happens next.
+- `needs_clarification` — the request states nothing checkable, so the change was
+  not judged and no retry was used. This is not a failed review and not a pass.
+  Say briefly what you took the request to mean, then resubmit the same request
+  with those acceptance criteria in `notes`.
 - `review_unavailable` — the judge could not be reached. This is not a failed
   review; say that the check did not run and why.
 
 Do not describe a `needs_fixes` verdict as an approval, and do not skip the call
 because you believe the change is small, obvious, or already reviewed.
+
+Read the verdict's `Reviewed scope:` line before you act on the feedback. It
+names the commits the review actually covered. If it is narrower than your work —
+for example you committed a step more than `scope.maxAgeHours` ago and did not
+list its files — report the missing files and submit again rather than treating
+the verdict as a judgment on work it never saw.
 ```
 
 ---

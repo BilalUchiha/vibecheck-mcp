@@ -277,6 +277,61 @@ describe("the review loop", () => {
 });
 
 /* ------------------------------------------------------------------ *
+ * Requests that cannot be judged
+ * ------------------------------------------------------------------ */
+
+const VAGUE_TASK = "make it better and better";
+
+const ACCEPTANCE_CRITERIA =
+  "Acceptance: app/reports.py must read its endpoint from the environment, and a failed request must raise rather than return None.";
+
+describe("unverifiable requests", () => {
+  it("refuses to judge a request that defines no done", async () => {
+    const repo = repoWithBadChange();
+    const result = await submitForReview({ task_description: VAGUE_TASK, project_root: repo.root });
+
+    assert.equal(result.verdict, "needs_clarification");
+    assert.equal(result.review_performed, false, "no judgment was made");
+    assert.equal(result.intent.verifiable, false);
+    assert.deepEqual(result.feedback, [], "there is nothing for the agent to fix");
+    assert.equal(result.attempts_remaining, result.max_retries, "the budget is untouched");
+    assert.match(result.next_action, /notes/, "the agent is told how to make the request judgeable");
+    assert.ok(result.scores && Object.keys(result.scores).length === 0, "no dimension was scored");
+  });
+
+  it("judges the same change once acceptance criteria are supplied", async () => {
+    const repo = repoWithBadChange();
+    const refused = await submitForReview({ task_description: VAGUE_TASK, project_root: repo.root });
+    assert.equal(refused.verdict, "needs_clarification");
+
+    const judged = await submitForReview({
+      task_description: VAGUE_TASK,
+      project_root: repo.root,
+      notes: ACCEPTANCE_CRITERIA,
+    });
+
+    assert.notEqual(judged.verdict, "needs_clarification", "the criteria made it judgeable");
+    assert.equal(judged.intent.verifiable, true);
+    assert.equal(judged.attempt_number, 1, "the refusal must not have spent the budget");
+    assert.ok(Object.keys(judged.scores).length > 0, "a real verdict was produced");
+  });
+
+  it("can be told to judge an unverifiable request anyway", async () => {
+    const repo = repoWithBadChange();
+    repo.write(CONFIG_FILENAME, JSON.stringify({ intent: { onUnverifiableRequest: "judge" } }));
+
+    const result = await submitForReview({ task_description: VAGUE_TASK, project_root: repo.root });
+
+    assert.notEqual(result.verdict, "needs_clarification");
+    assert.equal(result.intent.verifiable, false);
+    assert.ok(
+      result.warnings.some((warning) => warning.includes("no checkable requirement")),
+      "the verdict must still say the request could not be checked",
+    );
+  });
+});
+
+/* ------------------------------------------------------------------ *
  * Hard gates
  * ------------------------------------------------------------------ */
 

@@ -42,8 +42,15 @@ export class TempRepo {
     this.git(["config", "commit.gpgsign", "false"]);
   }
 
-  git(args: string[]): { status: number; stdout: string; stderr: string } {
-    const result = spawnSync("git", args, { cwd: this.root, encoding: "utf8", env: GIT_ENV });
+  git(
+    args: string[],
+    env?: Record<string, string>,
+  ): { status: number; stdout: string; stderr: string } {
+    const result = spawnSync("git", args, {
+      cwd: this.root,
+      encoding: "utf8",
+      env: env ? { ...GIT_ENV, ...env } : GIT_ENV,
+    });
     return { status: result.status ?? 1, stdout: result.stdout ?? "", stderr: result.stderr ?? "" };
   }
 
@@ -65,6 +72,21 @@ export class TempRepo {
   commit(message = "checkpoint"): void {
     this.git(["add", "-A"]);
     this.git(["-c", "commit.gpgsign=false", "commit", "-m", message, "--no-verify"]);
+  }
+
+  /**
+   * Commit everything with an explicit committer date.
+   *
+   * The default fixture date is fixed, so tests that exercise the review scope's
+   * age window have to set the clock themselves rather than rely on commit order
+   * alone.
+   */
+  commitAt(isoDate: string, message = "checkpoint"): void {
+    this.git(["add", "-A"]);
+    this.git(["-c", "commit.gpgsign=false", "commit", "-m", message, "--no-verify"], {
+      GIT_AUTHOR_DATE: isoDate,
+      GIT_COMMITTER_DATE: isoDate,
+    });
   }
 
   /** Commit only the paths given, leaving the rest as working-tree changes. */

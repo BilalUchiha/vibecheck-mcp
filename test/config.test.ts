@@ -2,7 +2,14 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import path from "node:path";
 import { after, describe, it } from "node:test";
-import { CONFIG_FILENAME, defaultConfig, loadConfig, mergeConfig, saveConfig } from "../src/config.js";
+import {
+  CONFIG_FILENAME,
+  MAX_RETRIES_LIMIT,
+  defaultConfig,
+  loadConfig,
+  mergeConfig,
+  saveConfig,
+} from "../src/config.js";
 import { makeSnakeCasePythonRepo, type TempRepo } from "./helpers/fixture.js";
 
 const repos: TempRepo[] = [];
@@ -46,9 +53,51 @@ describe("presets", () => {
   it("defaults to auto provider selection so a key is used when present", () => {
     assert.equal(defaultConfig().judge.provider, "auto");
   });
+
+  it("gives a request a roomy retry budget, independent of the preset", () => {
+    // The budget is about convergence, not strictness: a strict project should
+    // not get fewer chances to fix what the gate found, and a budget that expires
+    // while the fix list is still shrinking escalates a fixable change.
+    assert.equal(defaultConfig("lenient").maxRetries, 10);
+    assert.equal(defaultConfig("balanced").maxRetries, 10);
+    assert.equal(defaultConfig("strict").maxRetries, 10);
+  });
+
+  it("clamps an oversized retry budget to the declared limit", () => {
+    const { config } = mergeConfig(defaultConfig(), { maxRetries: 999 });
+    assert.equal(config.maxRetries, MAX_RETRIES_LIMIT);
+  });
+
+  it("defaults to reviewing the task's own commits rather than a single commit", () => {
+    const scope = defaultConfig().scope;
+    assert.equal(scope.mode, "auto");
+    assert.ok(scope.maxCommits > 1, "a staged task needs more than one commit in scope");
+    assert.ok(scope.maxAgeHours > 0);
+  });
 });
 
 describe("merging", () => {
+  it("ignores `//` comment keys instead of warning at them", () => {
+    const { errors } = mergeConfig(defaultConfig(), {
+      questions: { "//": "an annotated example config", readability: { threshold: 0.5 } } as never,
+    });
+    assert.deepEqual(errors, [], "comment keys are a convention, not a mistake");
+  });
+
+  it("merges scope settings and rejects an unknown mode", () => {
+    const merged = mergeConfig(defaultConfig(), {
+      scope: { mode: "working-tree", maxAgeHours: 6, maxCommits: 5 },
+    });
+    assert.equal(merged.config.scope.mode, "working-tree");
+    assert.equal(merged.config.scope.maxAgeHours, 6);
+    assert.equal(merged.config.scope.maxCommits, 5);
+    assert.deepEqual(merged.errors, []);
+
+    const invalid = mergeConfig(defaultConfig(), { scope: { mode: "everything" as never } });
+    assert.equal(invalid.config.scope.mode, "auto", "an invalid mode leaves the default in place");
+    assert.ok(invalid.errors.some((error) => error.includes("scope.mode")));
+  });
+
   it("applies a preset as a new baseline, then the overrides on top", () => {
     const base = defaultConfig("balanced");
     const { config } = mergeConfig(base, {

@@ -1,7 +1,7 @@
 {
   "//": "Production service or published library. Copy to .vibecheck.json in the project root.",
   "preset": "strict",
-  "maxRetries": 3,
+  "maxRetries": 10,
   "conventions": {
     "mode": "auto",
     "sampleSize": 12
@@ -14,5 +14,11 @@
     "failingTests": true,
     "committedSecret": true,
     "submissionMismatch": true
+  },
+  "scope": {
+    "//": "A production repo usually has a base branch, so the scope rarely matters here. Raise these for long agent sessions that commit in many steps.",
+    "mode": "auto",
+    "maxCommits": 30,
+    "maxAgeHours": 24
   }
 }

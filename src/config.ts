@@ -42,6 +42,36 @@ export interface ConventionsConfig {
   cacheTtlMs: number;
 }
 
+/**
+ * How much of the repository a review covers.
+ *
+ * When a branch has a base to compare against, the answer is obvious: everything
+ * since the merge-base. When it does not - an agent working straight on `main`,
+ * or a freshly initialised repository - git cannot say where the task began, and
+ * the answer determines whether the judge sees the whole task or a fraction of
+ * it. Reviewing too little is the dangerous direction: the judge then reasons
+ * about a one-file change as though it were the entire request and reports the
+ * task as under-delivered when it is not.
+ */
+export interface ScopeConfig {
+  /**
+   * `auto`          - the trailing run of commits that plausibly belongs to the
+   *                   task, widened by the files the agent reported (default).
+   * `last-commit`   - the newest commit only. Predictable, and wrong for any task
+   *                   that was committed in more than one step.
+   * `working-tree`  - never look at committed work.
+   */
+  mode: "auto" | "last-commit" | "working-tree";
+  /** Hard cap on how many commits one review may span. */
+  maxCommits: number;
+  /**
+   * How far back a commit may be, in hours, and still count as task work. A file
+   * the agent explicitly reports changing is reached regardless of age, as long
+   * as it falls inside `maxCommits`.
+   */
+  maxAgeHours: number;
+}
+
 /** `auto` uses TypeSafe when a key is present and the offline mock otherwise. */
 export type JudgeProvider = "auto" | "typesafe" | "mock";
 
@@ -67,6 +97,19 @@ export interface BudgetConfig {
   maxChangedFiles: number;
 }
 
+export interface IntentConfig {
+  /**
+   * What to do when the task description states no checkable requirement.
+   *
+   * `clarify` - refuse to judge it and ask for acceptance criteria (default).
+   *             Neither available verdict would be true: `approved` would certify
+   *             work nobody defined, and `needs_fixes` would send the agent after
+   *             problems that were never identified.
+   * `judge`   - score it anyway, gating on `satisfies_request` as usual.
+   */
+  onUnverifiableRequest: "clarify" | "judge";
+}
+
 export interface HardGatesConfig {
   /** Supplied test output reports failures. */
   failingTests: boolean;
@@ -78,12 +121,25 @@ export interface HardGatesConfig {
 
 export interface VibecheckConfig {
   preset: PresetName;
+  /**
+   * How many submissions a single request gets before the gate escalates to the
+   * user. Counted server-side from the log, keyed on the request wording, so the
+   * agent cannot reset it by reporting a different attempt number.
+   *
+   * The default is deliberately roomy. A review that keeps finding real defects
+   * is the gate working, not the agent looping, and a budget that runs out while
+   * a fix list is still shrinking turns a fixable change into an escalation. The
+   * budget exists to stop an agent that is not converging, so projects that want
+   * a short leash should lower it rather than rely on the default.
+   */
   maxRetries: number;
   questions: Record<GateDimension, QuestionConfig>;
   conventions: ConventionsConfig;
   judge: JudgeConfig;
   budget: BudgetConfig;
   hardGates: HardGatesConfig;
+  scope: ScopeConfig;
+  intent: IntentConfig;
 }
 
 export interface ResolvedConfig {
@@ -97,6 +153,27 @@ export interface ResolvedConfig {
 
 export const CONFIG_FILENAME = ".vibecheck.json";
 export const STATE_DIRNAME = ".vibecheck";
+
+/**
+ * Bounds for the review-scope settings, declared once.
+ *
+ * The config clamp and the `configure_project` schema both need these numbers,
+ * and a setting the tool accepts but the clamp silently narrows would change
+ * meaning between the two paths without anything failing.
+ */
+export const SCOPE_LIMITS = {
+  /** A review spanning more commits than this is almost certainly mis-scoped. */
+  maxCommits: 500,
+  /** One year, in hours: the ceiling for any scope window. */
+  maxAgeHours: 8760,
+} as const;
+
+/**
+ * The largest retry budget a project may set. Declared once for the same reason
+ * as the scope bounds: the clamp and the tool schema are two paths to the same
+ * setting, and they must not disagree.
+ */
+export const MAX_RETRIES_LIMIT = 20;
 
 interface PresetQuestionTable {
   thresholds: Record<GateDimension, number>;
@@ -179,7 +256,7 @@ export function defaultConfig(preset: PresetName = "balanced"): VibecheckConfig 
   }
   return {
     preset,
-    maxRetries: 3,
+    maxRetries: 10,
     questions,
     conventions: { mode: "auto", sampleSize: 8, cacheTtlMs: 6 * 60 * 60 * 1000 },
     judge: {
@@ -193,6 +270,8 @@ export function defaultConfig(preset: PresetName = "balanced"): VibecheckConfig 
     },
     budget: { maxStateChars: 60_000, maxCharsPerFile: 6_000, maxChangedFiles: 40 },
     hardGates: { failingTests: true, committedSecret: true, submissionMismatch: true },
+    scope: { mode: "auto", maxCommits: 20, maxAgeHours: 12 },
+    intent: { onUnverifiableRequest: "clarify" },
   };
 }
 
@@ -208,6 +287,8 @@ export interface PartialVibecheckConfig {
   judge?: Partial<JudgeConfig>;
   budget?: Partial<BudgetConfig>;
   hardGates?: Partial<HardGatesConfig>;
+  scope?: Partial<ScopeConfig>;
+  intent?: Partial<IntentConfig>;
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -238,11 +319,15 @@ export function mergeConfig(
   if (partial.maxRetries !== undefined) {
     const n = Number(partial.maxRetries);
     if (!Number.isFinite(n) || n < 1) errors.push("maxRetries must be a number >= 1");
-    config.maxRetries = clamp(Math.round(n), 1, 20);
+    config.maxRetries = clamp(Math.round(n), 1, MAX_RETRIES_LIMIT);
   }
 
   if (partial.questions) {
     for (const [key, value] of Object.entries(partial.questions)) {
+      // JSON has no comments, so a `//` key is the convention for an annotated
+      // example config. Skipping it keeps the shipped examples usable as-is
+      // instead of warning at a user who copied one verbatim.
+      if (key.startsWith("//")) continue;
       const dimension = key as GateDimension;
       const current = config.questions[dimension];
       if (!current) {
@@ -309,6 +394,34 @@ export function mergeConfig(
     if (h.failingTests !== undefined) config.hardGates.failingTests = Boolean(h.failingTests);
     if (h.committedSecret !== undefined) config.hardGates.committedSecret = Boolean(h.committedSecret);
     if (h.submissionMismatch !== undefined) config.hardGates.submissionMismatch = Boolean(h.submissionMismatch);
+  }
+
+  if (partial.intent) {
+    const i = partial.intent;
+    if (i.onUnverifiableRequest !== undefined) {
+      if (!["clarify", "judge"].includes(i.onUnverifiableRequest)) {
+        errors.push(`intent.onUnverifiableRequest must be one of clarify|judge`);
+      } else {
+        config.intent.onUnverifiableRequest = i.onUnverifiableRequest;
+      }
+    }
+  }
+
+  if (partial.scope) {
+    const s = partial.scope;
+    if (s.mode !== undefined) {
+      if (!["auto", "last-commit", "working-tree"].includes(s.mode)) {
+        errors.push(`scope.mode must be one of auto|last-commit|working-tree`);
+      } else {
+        config.scope.mode = s.mode;
+      }
+    }
+    if (s.maxCommits !== undefined) {
+      config.scope.maxCommits = clamp(Math.round(s.maxCommits), 1, SCOPE_LIMITS.maxCommits);
+    }
+    if (s.maxAgeHours !== undefined) {
+      config.scope.maxAgeHours = clamp(s.maxAgeHours, 0, SCOPE_LIMITS.maxAgeHours);
+    }
   }
 
   // Credentials come from the environment, never from the config file.
@@ -411,6 +524,8 @@ export function saveConfig(
   if (partial.judge) merged.judge = { ...(existing.judge as object), ...partial.judge };
   if (partial.budget) merged.budget = { ...(existing.budget as object), ...partial.budget };
   if (partial.hardGates) merged.hardGates = { ...(existing.hardGates as object), ...partial.hardGates };
+  if (partial.scope) merged.scope = { ...(existing.scope as object), ...partial.scope };
+  if (partial.intent) merged.intent = { ...(existing.intent as object), ...partial.intent };
   if (partial.questions) {
     const prior = isRecord(existing.questions) ? { ...existing.questions } : {};
     for (const [key, value] of Object.entries(partial.questions)) {
